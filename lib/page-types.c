@@ -67,7 +67,11 @@ static const char * const page_flag_names[] = {
 	[KPF_NOPAGE]		= "n:nopage",
 	[KPF_KSM]		= "x:ksm",
 	[KPF_THP]		= "t:thp",
+#ifdef KPF_OFFLINE
+	[KPF_OFFLINE]		= "o:offline",
+#else
 	[KPF_BALLOON]		= "o:balloon",
+#endif
 	[KPF_PGTABLE]		= "g:pgtable",
 
 #ifdef KPF_ZERO_PAGE
