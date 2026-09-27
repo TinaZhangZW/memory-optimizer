@@ -201,6 +201,17 @@ int EPTMigrate::select_top_pages(ProcIdlePageType type)
 
 int EPTMigrate::migrate()
 {
+  if (option.migration_backend == "none")
+    return 0;
+  if (option.migration_backend == "zswap") {
+    if (!idle_scanner || option.cold_max_refs < 0)
+      return -EINVAL;
+    pages_addr[0].clear();
+    int ret = select_top_pages(PTE_IDLE);
+    if (ret) return std::min(ret, 0);
+    return idle_scanner->pageout(pages_addr[0], option.max_pageout_pages);
+  }
+
   int err = 0;
 
   // Assume PLACEMENT_DRAM processes will mlock themselves to LRU_UNEVICTABLE.

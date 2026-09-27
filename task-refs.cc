@@ -49,6 +49,11 @@ static const struct option opts[] = {
   {"help",      no_argument,        NULL, 'h'},
   {"changes",   no_argument,        NULL, 'g'},
   {"version",   no_argument,        NULL, 'r'},
+  {"scan",      required_argument,  NULL, 1000},
+  {"backend",   required_argument,  NULL, 1001},
+  {"addresses", required_argument,  NULL, 1002},
+  {"ram-range", required_argument,  NULL, 1003},
+  {"max-pageout-pages", required_argument, NULL, 1004},
   {NULL,        0,                  NULL, 0}
 };
 
@@ -69,6 +74,15 @@ static void usage(char *prog)
           "    -r|--version    Show version info\n",
           prog);
 
+  fprintf(stderr,
+      "    --scan proc-idle|idle-bitmap\n"
+      "    --backend numa|none|zswap\n"
+      "    --addresses FILE  Explicit HVA allowlist for idle-bitmap\n"
+      "    --ram-range HEX:HEX  Allowed guest RAM HVA interval\n"
+      "    --max-pageout-pages N  Maximum pageout attempts (default 4096)\n"
+      "idle-bitmap requires -l 1..255, -i > 0 and backend none or zswap.\n"
+      "zswap additionally requires -c >= 0; pageout success is not a zswap guarantee.\n");
+
   exit(0);
 }
 
@@ -80,6 +94,31 @@ static void parse_cmdline(int argc, char *argv[])
 
   while ((opt = getopt_long(argc, argv, optstr, opts, &options_index)) != EOF) {
     switch (opt) {
+    case 1000:
+      option.scan_backend = optarg;
+      break;
+    case 1001:
+      option.migration_backend = optarg;
+      break;
+    case 1002:
+      option.address_file = optarg;
+      break;
+    case 1003: {
+      char extra;
+      if (sscanf(optarg, "%lx:%lx%c", &option.ram_start, &option.ram_end, &extra) != 2) {
+        fprintf(stderr, "invalid --ram-range\n"); exit(2);
+      }
+      break;
+    }
+    case 1004: {
+      char *end;
+      errno = 0;
+      option.max_pageout_pages = strtoul(optarg, &end, 10);
+      if (errno || *end || !option.max_pageout_pages || optarg[0] < '0' || optarg[0] > '9') {
+        fprintf(stderr, "invalid --max-pageout-pages\n"); exit(2);
+      }
+      break;
+    }
     case 0:
       break;
     case 'p':
@@ -121,6 +160,15 @@ static void parse_cmdline(int argc, char *argv[])
 
   if (!option.pid)
     usage(argv[0]);
+
+  if ((option.scan_backend != "proc-idle" && option.scan_backend != "idle-bitmap") ||
+      (option.migration_backend != "numa" && option.migration_backend != "none" && option.migration_backend != "zswap") ||
+      (option.scan_backend == "idle-bitmap" && (option.migration_backend == "numa" ||
+        option.address_file.empty() || option.nr_walks < 1 || option.nr_walks > 255)) ||
+      (option.migration_backend == "zswap" && (option.scan_backend != "idle-bitmap" || option.cold_max_refs < 0))) {
+    fprintf(stderr, "invalid scan/backend combination or missing POC options\n");
+    exit(2);
+  }
 
   if (option.output_file.empty())
     option.output_file = "refs-count-" + std::to_string(option.pid);

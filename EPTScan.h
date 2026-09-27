@@ -12,6 +12,7 @@
 #include <string>
 
 #include "ProcIdlePages.h"
+#include "IdleBitmapScan.h"
 
 class EPTScan: public ProcIdlePages
 {
@@ -26,6 +27,9 @@ class EPTScan: public ProcIdlePages
 
     void count_refs();
     static int save_counts(std::string filename);
+
+  protected:
+    std::shared_ptr<IdleBitmapScan> idle_scanner;
 
   private:
     bool should_stop();

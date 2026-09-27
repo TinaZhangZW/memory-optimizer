@@ -61,6 +61,16 @@ void EPTScan::gather_walk_stats(unsigned long& young_bytes,
 
 int EPTScan::walk_multi(int nr, float interval)
 {
+  if (option.scan_backend == "idle-bitmap") {
+    prepare_walks(nr);
+    idle_scanner = std::make_shared<IdleBitmapScan>();
+    int ret = idle_scanner->scan(pid, option.ram_start, option.ram_end,
+        option.address_file, nr, interval, option.output_file + ".pages.tsv",
+        get_pagetype_refs(PTE_ACCESSED).page_refs);
+    if (!ret) nr_walks = nr;
+    return ret;
+  }
+
   int err;
   const int max_walks = 30;
   bool auto_stop = false;
@@ -190,7 +200,7 @@ int EPTScan::save_counts(std::string filename)
 
   for (int i = 0; i < nr; i++) {
     fprintf(file, "%4d", i);
-    for (const int& type: {PTE_ACCESSED, PMD_ACCESSED, PUD_PRESENT}) {
+    for (const auto type: {PTE_ACCESSED, PMD_ACCESSED, PUD_PRESENT}) {
       unsigned long pages = sys_refs_count[type][i];
       unsigned long kb = pages * (pagetype_size[type] >> 10);
       fprintf(file, " %'15lu", kb);
@@ -201,7 +211,7 @@ int EPTScan::save_counts(std::string filename)
 
   fprintf(file, "SUM ");
   unsigned long total_kb = 0;
-  for (const int& type: {PTE_ACCESSED, PMD_ACCESSED, PUD_PRESENT}) {
+  for (const auto type: {PTE_ACCESSED, PMD_ACCESSED, PUD_PRESENT}) {
     unsigned long kb = sum_kb[type];
     fprintf(file, " %'15lu", kb);
     total_kb += kb;
@@ -213,4 +223,3 @@ int EPTScan::save_counts(std::string filename)
 
   return err;
 }
-

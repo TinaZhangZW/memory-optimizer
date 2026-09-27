@@ -150,6 +150,13 @@ public:
   std::string output_file;
   std::string config_file;
 
+  std::string scan_backend = "proc-idle";
+  std::string migration_backend = "numa";
+  std::string address_file;
+  unsigned long ram_start = 0;
+  unsigned long ram_end = 0;
+  unsigned long max_pageout_pages = 4096;
+
   NumaHWConfig numa_hw_config;
   NumaHWConfigV2 numa_hw_config_v2;
 
