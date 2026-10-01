@@ -150,6 +150,7 @@ public:
   std::string output_file;
   std::string config_file;
 
+  unsigned bitmap_batch_bytes = 8;
   std::string scan_backend = "proc-idle";
   std::string migration_backend = "numa";
   std::string address_file;

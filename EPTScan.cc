@@ -66,7 +66,8 @@ int EPTScan::walk_multi(int nr, float interval)
     idle_scanner = std::make_shared<IdleBitmapScan>();
     int ret = idle_scanner->scan(pid, option.ram_start, option.ram_end,
         option.address_file, nr, interval, option.output_file + ".pages.tsv",
-        get_pagetype_refs(PTE_ACCESSED).page_refs);
+        get_pagetype_refs(PTE_ACCESSED).page_refs,
+        option.output_file + ".bitmap-stats.tsv", option.bitmap_batch_bytes);
     if (!ret) nr_walks = nr;
     return ret;
   }

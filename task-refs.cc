@@ -49,6 +49,7 @@ static const struct option opts[] = {
   {"help",      no_argument,        NULL, 'h'},
   {"changes",   no_argument,        NULL, 'g'},
   {"version",   no_argument,        NULL, 'r'},
+  {"bitmap-batch-bytes", required_argument, NULL, 1005},
   {"scan",      required_argument,  NULL, 1000},
   {"backend",   required_argument,  NULL, 1001},
   {"addresses", required_argument,  NULL, 1002},
@@ -77,10 +78,12 @@ static void usage(char *prog)
   fprintf(stderr,
       "    --scan proc-idle|idle-bitmap\n"
       "    --backend numa|none|zswap\n"
+      "    --bitmap-batch-bytes N  Max contiguous bitmap I/O bytes (8..4096, multiple of 8; default 8)\n"
       "    --addresses FILE  Explicit HVA allowlist for idle-bitmap\n"
       "    --ram-range HEX:HEX  Allowed guest RAM HVA interval\n"
       "    --max-pageout-pages N  Maximum pageout attempts (default 4096)\n"
       "idle-bitmap requires -l 1..255, -i > 0 and backend none or zswap.\n"
+      "idle-bitmap writes per-round I/O timing and counts to <output>.bitmap-stats.tsv.\n"
       "zswap additionally requires -c >= 0; pageout success is not a zswap guarantee.\n");
 
   exit(0);
@@ -108,6 +111,17 @@ static void parse_cmdline(int argc, char *argv[])
       if (sscanf(optarg, "%lx:%lx%c", &option.ram_start, &option.ram_end, &extra) != 2) {
         fprintf(stderr, "invalid --ram-range\n"); exit(2);
       }
+      break;
+    }
+    case 1005: {
+      char *end;
+      errno = 0;
+      unsigned long bytes = strtoul(optarg, &end, 10);
+      if (errno || *end || optarg[0] < '0' || optarg[0] > '9' ||
+          bytes < 8 || bytes > 4096 || bytes % 8) {
+        fprintf(stderr, "invalid --bitmap-batch-bytes\n"); exit(2);
+      }
+      option.bitmap_batch_bytes = bytes;
       break;
     }
     case 1004: {

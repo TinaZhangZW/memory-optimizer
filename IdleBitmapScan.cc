@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -83,6 +84,34 @@ static void wait_sample_interval(double interval)
   // clock_nanosleep() returns the error number directly, without setting errno.
   if (error)
     throw std::runtime_error("sample wait: " + std::string(strerror(error)));
+}
+
+static uint64_t clock_ns(clockid_t clock)
+{
+  struct timespec ts;
+  if (clock_gettime(clock, &ts))
+    throw std::runtime_error("bitmap statistics clock: " + std::string(strerror(errno)));
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
+}
+
+// Time a whole phase, not every syscall. Includes loop/counter overhead, but
+// excludes PFN discovery, observation sleep, mapping rechecks and reporting.
+template <typename F>
+static void measure_phase(uint64_t& wall_ns, uint64_t& cpu_ns, F operation)
+{
+  const auto wall_start = clock_ns(CLOCK_MONOTONIC);
+  const auto cpu_start = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+  auto finish = [&]() {
+    cpu_ns += clock_ns(CLOCK_THREAD_CPUTIME_ID) - cpu_start;
+    wall_ns += clock_ns(CLOCK_MONOTONIC) - wall_start;
+  };
+  try {
+    operation();
+  } catch (...) {
+    finish();
+    throw;
+  }
+  finish();
 }
 
 static void validate_scan_args(int pid, unsigned long start, unsigned long end,
@@ -186,9 +215,29 @@ bool IdleBitmapScan::mapping_matches(unsigned long address, uint64_t pfn) const
   return pfn && mapping(address) == pfn && eligible(pfn);
 }
 
-void IdleBitmapScan::sample_round(const std::vector<unsigned long>& addresses,
-                                 std::vector<PageSample>& samples, double interval)
+void IdleBitmapScan::bitmap_io(bool write, std::vector<uint64_t>& words, uint64_t offset,
+                               BitmapIOStats& stats)
 {
+  const size_t bytes = words.size() * WORD_BYTES;
+  ++stats.calls;
+  ssize_t n = write ? pwrite(bitmap_fd, words.data(), bytes, offset)
+                    : pread(bitmap_fd, words.data(), bytes, offset);
+  if (n < 0) {
+    ++stats.errors;
+    throw std::runtime_error(std::string(write ? "mark idle: " : "read idle: ") + strerror(errno));
+  }
+  stats.bytes += n;
+  if (static_cast<size_t>(n) != bytes) {
+    ++stats.short_calls;
+    throw std::runtime_error(write ? "short kernel bitmap write" : "short kernel bitmap read");
+  }
+}
+
+void IdleBitmapScan::sample_round(const std::vector<unsigned long>& addresses,
+                                 std::vector<PageSample>& samples, double interval,
+                                 RoundStats& stats)
+{
+  stats.requested_hvas = addresses.size();
   if (!alive())
     throw std::runtime_error("target exited");
 
@@ -203,21 +252,43 @@ void IdleBitmapScan::sample_round(const std::vector<unsigned long>& addresses,
       sample.pfn = 0;
       continue;
     }
+    ++stats.eligible_hvas;
     bitmap_words[sample.pfn / WORD_BITS] |= 1ULL << (sample.pfn % WORD_BITS);
   }
 
-  // Writing a set bit establishes an idle baseline for the corresponding PFN.
+  stats.bitmap_words = bitmap_words.size();
+  for (const auto& word : bitmap_words)
+    stats.unique_pfns += __builtin_popcountll(word.second);
+
+  // Only merge consecutive selected words: batching never widens read coverage.
+  struct Batch { uint64_t first; std::vector<uint64_t> words; };
+  std::vector<Batch> batches;
   for (const auto& word : bitmap_words) {
-    if (pwrite(bitmap_fd, &word.second, WORD_BYTES, word.first * WORD_BYTES) != WORD_BYTES)
-      throw std::runtime_error("mark idle: " + std::string(strerror(errno)));
+    if (batches.empty() || batches.back().first + batches.back().words.size() != word.first ||
+        batches.back().words.size() == bitmap_batch_bytes / WORD_BYTES)
+      batches.push_back({word.first, {}});
+    batches.back().words.push_back(word.second);
   }
 
-  wait_sample_interval(interval);
+  // Writing a set bit establishes an idle baseline for the corresponding PFN.
+  measure_phase(stats.write.wall_ns, stats.write.cpu_ns, [&]() {
+    for (auto& batch : batches)
+      bitmap_io(true, batch.words, batch.first * WORD_BYTES, stats.write);
+  });
+
+  uint64_t wait_cpu_ns = 0;
+  measure_phase(stats.wait_wall_ns, wait_cpu_ns, [&]() { wait_sample_interval(interval); });
   if (!alive())
     throw std::runtime_error("target exited during sampling");
 
-  for (auto& word : bitmap_words)
-    word.second = read_word(bitmap_fd, word.first * WORD_BYTES);
+  measure_phase(stats.read.wall_ns, stats.read.cpu_ns, [&]() {
+    for (auto& batch : batches)
+      bitmap_io(false, batch.words, batch.first * WORD_BYTES, stats.read);
+  });
+
+  for (const auto& batch : batches)
+    for (size_t i = 0; i < batch.words.size(); ++i)
+      bitmap_words.at(batch.first + i) = batch.words[i];
 
   for (size_t i = 0; i < addresses.size(); ++i) {
     auto& sample = samples[i];
@@ -226,13 +297,81 @@ void IdleBitmapScan::sample_round(const std::vector<unsigned long>& addresses,
       continue;
 
     ++sample.valid_rounds;
+    ++stats.valid_hvas;
     uint64_t idle_mask = 1ULL << (sample.pfn % WORD_BITS);
     bool idle = bitmap_words.at(sample.pfn / WORD_BITS) & idle_mask;
 
     // Count accessed windows, not the number of CPU memory accesses.
-    if (!idle)
+    if (!idle) {
       ++sample.accessed_rounds;
+      ++stats.accessed_hvas;
+    } else {
+      ++stats.idle_hvas;
+    }
   }
+  stats.complete = true;
+}
+
+void IdleBitmapScan::report_stats(const std::vector<RoundStats>& rounds,
+                                  const std::string& output, int scan_rc) const
+{
+  RoundStats total;
+  unsigned completed = 0;
+  auto add_io = [](BitmapIOStats& dst, const BitmapIOStats& src) {
+    dst.calls += src.calls;
+    dst.bytes += src.bytes;
+    dst.short_calls += src.short_calls;
+    dst.errors += src.errors;
+    dst.wall_ns += src.wall_ns;
+    dst.cpu_ns += src.cpu_ns;
+  };
+  for (const auto& s : rounds) {
+    completed += s.complete;
+    total.requested_hvas += s.requested_hvas;
+    total.eligible_hvas += s.eligible_hvas;
+    total.unique_pfns += s.unique_pfns;
+    total.bitmap_words += s.bitmap_words;
+    total.valid_hvas += s.valid_hvas;
+    total.idle_hvas += s.idle_hvas;
+    total.accessed_hvas += s.accessed_hvas;
+    total.wait_wall_ns += s.wait_wall_ns;
+    add_io(total.write, s.write);
+    add_io(total.read, s.read);
+  }
+  total.complete = scan_rc == 0;
+  fprintf(stderr, "idle-bitmap stats: scan_rc=%d rounds_started=%zu rounds_completed=%u "
+          "write_calls=%" PRIu64 " write_bytes=%" PRIu64 " write_wall_ms=%.3f write_cpu_ms=%.3f "
+          "read_calls=%" PRIu64 " read_bytes=%" PRIu64 " read_wall_ms=%.3f read_cpu_ms=%.3f "
+          "wait_wall_ms=%.3f\n", scan_rc, rounds.size(), completed,
+          total.write.calls, total.write.bytes, total.write.wall_ns / 1e6, total.write.cpu_ns / 1e6,
+          total.read.calls, total.read.bytes, total.read.wall_ns / 1e6, total.read.cpu_ns / 1e6,
+          total.wait_wall_ns / 1e6);
+
+  if (output.empty())
+    return;
+  std::ofstream out(output);
+  if (!out)
+    throw std::runtime_error("cannot open bitmap statistics output");
+  out << "round\tcomplete\trequested_hvas\teligible_hvas\tunique_pfns\tbitmap_words"
+         "\tplanned_pfn_positions\tvalid_hvas\tidle_hvas\taccessed_hvas"
+         "\twrite_calls\twrite_bytes\twrite_short_calls\twrite_errors\twrite_wall_ns\twrite_cpu_ns"
+         "\tread_calls\tread_bytes\tread_short_calls\tread_errors\tread_wall_ns\tread_cpu_ns"
+         "\twait_wall_ns\tbatch_bytes\n";
+  auto row = [&](const std::string& label, const RoundStats& s) {
+    out << label << '\t' << s.complete << '\t' << s.requested_hvas << '\t' << s.eligible_hvas
+        << '\t' << s.unique_pfns << '\t' << s.bitmap_words << '\t' << s.bitmap_words * WORD_BITS
+        << '\t' << s.valid_hvas << '\t' << s.idle_hvas << '\t' << s.accessed_hvas;
+    for (const auto* io : {&s.write, &s.read})
+      out << '\t' << io->calls << '\t' << io->bytes << '\t' << io->short_calls << '\t' << io->errors
+          << '\t' << io->wall_ns << '\t' << io->cpu_ns;
+    out << '\t' << s.wait_wall_ns << '\t' << bitmap_batch_bytes << '\n';
+  };
+  for (size_t i = 0; i < rounds.size(); ++i)
+    row(std::to_string(i + 1), rounds[i]);
+  row("total", total);
+  out.close();
+  if (!out)
+    throw std::runtime_error("bitmap statistics output write failed");
 }
 
 unsigned IdleBitmapScan::save_results(const std::vector<unsigned long>& addresses,
@@ -276,13 +415,18 @@ unsigned IdleBitmapScan::save_results(const std::vector<unsigned long>& addresse
 
 int IdleBitmapScan::scan(int pid, unsigned long start, unsigned long end,
     const std::string& address_file, int rounds, double interval,
-    const std::string& output, AddrSequence& refs)
+    const std::string& output, AddrSequence& refs, const std::string& stats_output, unsigned batch_bytes)
 {
   reset();
+  bitmap_batch_bytes = batch_bytes;
   refs.clear();
+  std::vector<RoundStats> statistics;
+  int result = -EINVAL;
 
   try {
     validate_scan_args(pid, start, end, rounds, interval);
+    if (batch_bytes < WORD_BYTES || batch_bytes > BASE_PAGE_SIZE || batch_bytes % WORD_BYTES)
+      throw std::runtime_error("bitmap batch size must be a multiple of 8 in [8, 4096]");
 
     pidfd = syscall(SYS_pidfd_open, pid, 0);
     if (pidfd < 0)
@@ -295,21 +439,32 @@ int IdleBitmapScan::scan(int pid, unsigned long start, unsigned long end,
     validate_mappings(pid, addresses);
 
     std::vector<PageSample> samples(addresses.size());
-    for (int round = 0; round < rounds; ++round)
-      sample_round(addresses, samples, interval);
+    statistics.reserve(rounds);
+    for (int round = 0; round < rounds; ++round) {
+      statistics.emplace_back();
+      sample_round(addresses, samples, interval, statistics.back());
+    }
 
     unsigned complete = save_results(addresses, samples, rounds, output, refs);
     fprintf(stderr, "idle-bitmap: requested=%zu fully_sampled=%u skipped=%zu\n",
             addresses.size(), complete, addresses.size() - complete);
     if (!complete)
       reset();
-    return complete ? 0 : -ENODATA;
+    result = complete ? 0 : -ENODATA;
+  } catch (const std::exception& e) {
+    fprintf(stderr, "idle-bitmap: %s\n", e.what());
+    reset();
+    refs.clear();
+  }
+  try {
+    report_stats(statistics, stats_output, result);
   } catch (const std::exception& e) {
     fprintf(stderr, "idle-bitmap: %s\n", e.what());
     reset();
     refs.clear();
     return -EINVAL;
   }
+  return result;
 }
 
 int IdleBitmapScan::pageout(const std::vector<void *>& addresses, unsigned long max_pageout_pages)
