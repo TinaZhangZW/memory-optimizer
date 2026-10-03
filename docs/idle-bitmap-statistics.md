@@ -169,3 +169,28 @@ Use `unique_pfns` and `planned_pfn_positions` to explain sparse physical coverag
 ## Validation
 
 `bash tests/run-idle-bitmap-scan.sh` uses mocked kernel interfaces. It checks deterministic per-round and total wall/CPU timing, exclusion of the observation wait, word grouping, PFN aliases, idle/accessed sample counts, failures, short transfers, output failure, and reset between scans. The existing real-clock signal test also verifies that interruption does not shorten the observation window. Parallel tests additionally verify actual overlapping I/O, independent descriptors, phase ordering, no duplicate coverage, deterministic summed worker CPU time, idle workers, invalid thread counts, and cleanup on worker/open failures. These are correctness tests, not measurements of real idle-bitmap kernel performance.
+
+## Page reclaim timing
+
+With `--backend zswap`, `task-refs` also prints `pageout stats`:
+
+- `calls`: attempted `process_madvise(MADV_PAGEOUT)` calls, including failures and short results. Each currently submits one 4 KiB page.
+- `syscall_wall_ms`: sum of monotonic elapsed intervals around those calls.
+- `syscall_cpu_ms`: sum of calling-thread CPU intervals around those calls; excludes work performed by other threads.
+- `submit_wall_ms` / `submit_cpu_ms`: the submission loop, including target liveness checks, mapping rechecks, timing and bookkeeping.
+- `total_wall_ms` / `total_cpu_ms`: submission plus the final pagemap verification pass.
+
+These phases exclude the preceding idle bitmap scan. The intervals overlap;
+do not add syscall, submission and total values together. Per-call clock reads
+add overhead: the CPU interval also surrounds the two wall-clock reads. This
+is elapsed/CPU time around a syscall, not a measurement of syscall entry/exit
+instructions alone. The whole command additionally includes address loading,
+validation, scan result output and candidate selection.
+
+`submitted_bytes` is the sum of fully successful advice results, not proof
+that all those pages were freed. `swapped_after` counts swapped PTEs observed
+in the subsequent pagemap pass, which is not an atomic snapshot and does not
+by itself prove zswap storage or immediate return of PFNs to the buddy allocator.
+Use zswap and swap-I/O counter deltas alongside these values. Host zswap must
+be enabled and sufficient swap slots must be available even for compressible
+pages stored in RAM.

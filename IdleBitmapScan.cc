@@ -603,8 +603,12 @@ int IdleBitmapScan::pageout(const std::vector<void *>& addresses, unsigned long 
   unsigned long swapped_pages = 0;
   unsigned long error_pages = 0;
   std::vector<unsigned long> requested;
+  uint64_t syscall_wall_ns = 0;
+  uint64_t syscall_cpu_ns = 0;
 
   try {
+    const uint64_t phase_wall_start = clock_ns(CLOCK_MONOTONIC);
+    const uint64_t phase_cpu_start = clock_ns(CLOCK_THREAD_CPUTIME_ID);
     for (void *ptr : addresses) {
       if (attempted_pages >= max_pageout_pages)
         break;
@@ -622,17 +626,25 @@ int IdleBitmapScan::pageout(const std::vector<void *>& addresses, unsigned long 
 
       struct iovec iov = {ptr, BASE_PAGE_SIZE};
       ++attempted_pages;
+      const uint64_t call_cpu_start = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+      const uint64_t call_wall_start = clock_ns(CLOCK_MONOTONIC);
       ssize_t bytes_advised = syscall(SYS_process_madvise, pidfd, &iov, 1, MADV_PAGEOUT, 0);
+      const int advise_errno = errno;
+      syscall_wall_ns += clock_ns(CLOCK_MONOTONIC) - call_wall_start;
+      syscall_cpu_ns += clock_ns(CLOCK_THREAD_CPUTIME_ID) - call_cpu_start;
 
       if (bytes_advised != BASE_PAGE_SIZE) {
         ++error_pages;
         if (bytes_advised < 0)
-          fprintf(stderr, "pageout 0x%lx: %s\n", address, strerror(errno));
+          fprintf(stderr, "pageout 0x%lx: %s\n", address, strerror(advise_errno));
         continue;
       }
       submitted_bytes += bytes_advised;
       requested.push_back(address);
     }
+
+    const uint64_t submit_wall_ns = clock_ns(CLOCK_MONOTONIC) - phase_wall_start;
+    const uint64_t submit_cpu_ns = clock_ns(CLOCK_THREAD_CPUTIME_ID) - phase_cpu_start;
 
     // A swapped PTE does not distinguish zswap from ordinary swap or swapcache.
     for (unsigned long address : requested) {
@@ -644,6 +656,12 @@ int IdleBitmapScan::pageout(const std::vector<void *>& addresses, unsigned long 
 
     fprintf(stderr, "pageout: candidates=%zu attempted_pages=%lu submitted_bytes=%lu skipped=%lu errors=%lu swapped_after=%lu\n",
             addresses.size(), attempted_pages, submitted_bytes, skipped_pages, error_pages, swapped_pages);
+    const uint64_t total_wall_ns = clock_ns(CLOCK_MONOTONIC) - phase_wall_start;
+    const uint64_t total_cpu_ns = clock_ns(CLOCK_THREAD_CPUTIME_ID) - phase_cpu_start;
+    fprintf(stderr, "pageout stats: calls=%lu syscall_wall_ms=%.3f syscall_cpu_ms=%.3f "
+            "submit_wall_ms=%.3f submit_cpu_ms=%.3f total_wall_ms=%.3f total_cpu_ms=%.3f\n",
+            attempted_pages, syscall_wall_ns / 1e6, syscall_cpu_ns / 1e6,
+            submit_wall_ns / 1e6, submit_cpu_ns / 1e6, total_wall_ns / 1e6, total_cpu_ns / 1e6);
     return error_pages ? -EIO : 0;
   } catch (const std::exception& e) {
     fprintf(stderr, "pageout: %s\n", e.what());
