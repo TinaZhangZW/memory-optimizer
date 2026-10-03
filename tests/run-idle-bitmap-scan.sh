@@ -11,7 +11,7 @@ for symbol in open close sysconf poll pread pwrite syscall clock_gettime clock_n
     wrap_flags+=("-Wl,--wrap=$symbol")
 done
 
-"${CXX:-g++}" -std=c++11 -Wall -g -I"$repo_dir" \
+"${CXX:-g++}" -std=c++11 -Wall -g -pthread -I"$repo_dir" \
     "$repo_dir/tests/idle-bitmap-scan.cc" \
     "$repo_dir/IdleBitmapScan.cc" "$repo_dir/AddrSequence.cc" \
     "${wrap_flags[@]}" -o "$test_dir/test"

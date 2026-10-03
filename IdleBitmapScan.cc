@@ -7,6 +7,11 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <condition_variable>
+#include <exception>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <fcntl.h>
 #include <fstream>
 #include <linux/kernel-page-flags.h>
@@ -22,7 +27,7 @@ static constexpr unsigned BASE_PAGE_SHIFT = 12;
 static constexpr unsigned long BASE_PAGE_SIZE = 1UL << BASE_PAGE_SHIFT;
 static constexpr unsigned WORD_BYTES = sizeof(uint64_t);
 static constexpr unsigned WORD_BITS = WORD_BYTES * 8;
-static constexpr unsigned MAX_SAMPLE_PAGES = 262144;
+static constexpr unsigned MAX_SAMPLE_PAGES = 16777216; // Explicit opt-in, up to 64 GiB.
 static constexpr int MAX_SAMPLE_ROUNDS = 255;
 static constexpr double MAX_INTERVAL_SECONDS = 60;
 
@@ -114,6 +119,74 @@ static void measure_phase(uint64_t& wall_ns, uint64_t& cpu_ns, F operation)
   finish();
 }
 
+// Persistent workers keep thread creation outside measured bitmap phases.
+// Every dispatch is synchronous: all workers finish before the next phase.
+class BitmapWorkerPool {
+public:
+  explicit BitmapWorkerPool(unsigned count) : failures(count) {
+    try {
+      for (unsigned i = 0; i < count; ++i)
+        threads.emplace_back([this, i]() { worker(i); });
+    } catch (...) {
+      stop();
+      throw;
+    }
+  }
+  ~BitmapWorkerPool() { stop(); }
+  BitmapWorkerPool(const BitmapWorkerPool&) = delete;
+  BitmapWorkerPool& operator=(const BitmapWorkerPool&) = delete;
+
+  void run(std::function<void(unsigned)> operation) {
+    std::unique_lock<std::mutex> lock(mutex);
+    job = std::move(operation);
+    std::fill(failures.begin(), failures.end(), nullptr);
+    remaining = threads.size();
+    ++generation;
+    ready.notify_all();
+    done.wait(lock, [&]() { return remaining == 0; });
+    job = nullptr;
+    for (const auto& failure : failures)
+      if (failure)
+        std::rethrow_exception(failure);
+  }
+
+private:
+  void worker(unsigned index) {
+    unsigned long seen = 0;
+    std::unique_lock<std::mutex> lock(mutex);
+    for (;;) {
+      ready.wait(lock, [&]() { return stopping || seen != generation; });
+      if (stopping)
+        return;
+      seen = generation;
+      lock.unlock();
+      std::exception_ptr failure;
+      try { job(index); } catch (...) { failure = std::current_exception(); }
+      lock.lock();
+      failures[index] = failure;
+      if (--remaining == 0)
+        done.notify_one();
+    }
+  }
+  void stop() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      stopping = true;
+    }
+    ready.notify_all();
+    for (auto& thread : threads)
+      thread.join();
+  }
+  std::mutex mutex;
+  std::condition_variable ready, done;
+  std::vector<std::thread> threads;
+  std::vector<std::exception_ptr> failures;
+  std::function<void(unsigned)> job;
+  size_t remaining = 0;
+  unsigned long generation = 0;
+  bool stopping = false;
+};
+
 static void validate_scan_args(int pid, unsigned long start, unsigned long end,
                                int rounds, double interval)
 {
@@ -126,7 +199,7 @@ static void validate_scan_args(int pid, unsigned long start, unsigned long end,
 
 static std::vector<unsigned long> read_addresses(const std::string& filename,
                                                 unsigned long start,
-                                                unsigned long end)
+                                                unsigned long end, unsigned max_pages)
 {
   std::ifstream input(filename);
   if (!input)
@@ -143,8 +216,8 @@ static std::vector<unsigned long> read_addresses(const std::string& filename,
         address < start || address >= end)
       throw std::runtime_error("unaligned address or address outside RAM range");
     addresses.push_back(address);
-    if (addresses.size() > MAX_SAMPLE_PAGES)
-      throw std::runtime_error("POC allowlist limit is 262144 pages");
+    if (addresses.size() > max_pages)
+      throw std::runtime_error("address allowlist exceeds configured bitmap page limit");
   }
 
   std::sort(addresses.begin(), addresses.end());
@@ -181,7 +254,9 @@ void IdleBitmapScan::reset()
   close_file(pidfd);
   close_file(pagemap_fd);
   close_file(flags_fd);
-  close_file(bitmap_fd);
+  for (auto& fd : bitmap_fds)
+    close_file(fd);
+  bitmap_fds.clear();
   sampled_pfns.clear();
 }
 
@@ -215,13 +290,13 @@ bool IdleBitmapScan::mapping_matches(unsigned long address, uint64_t pfn) const
   return pfn && mapping(address) == pfn && eligible(pfn);
 }
 
-void IdleBitmapScan::bitmap_io(bool write, std::vector<uint64_t>& words, uint64_t offset,
+void IdleBitmapScan::bitmap_io(int fd, bool write, std::vector<uint64_t>& words, uint64_t offset,
                                BitmapIOStats& stats)
 {
   const size_t bytes = words.size() * WORD_BYTES;
   ++stats.calls;
-  ssize_t n = write ? pwrite(bitmap_fd, words.data(), bytes, offset)
-                    : pread(bitmap_fd, words.data(), bytes, offset);
+  ssize_t n = write ? pwrite(fd, words.data(), bytes, offset)
+                    : pread(fd, words.data(), bytes, offset);
   if (n < 0) {
     ++stats.errors;
     throw std::runtime_error(std::string(write ? "mark idle: " : "read idle: ") + strerror(errno));
@@ -235,7 +310,7 @@ void IdleBitmapScan::bitmap_io(bool write, std::vector<uint64_t>& words, uint64_
 
 void IdleBitmapScan::sample_round(const std::vector<unsigned long>& addresses,
                                  std::vector<PageSample>& samples, double interval,
-                                 RoundStats& stats)
+                                 RoundStats& stats, BitmapWorkerPool& workers)
 {
   stats.requested_hvas = addresses.size();
   if (!alive())
@@ -270,21 +345,58 @@ void IdleBitmapScan::sample_round(const std::vector<unsigned long>& addresses,
     batches.back().words.push_back(word.second);
   }
 
-  // Writing a set bit establishes an idle baseline for the corresponding PFN.
-  measure_phase(stats.write.wall_ns, stats.write.cpu_ns, [&]() {
-    for (auto& batch : batches)
-      bitmap_io(true, batch.words, batch.first * WORD_BYTES, stats.write);
-  });
+  stats.active_workers = std::min<size_t>(bitmap_threads, batches.size());
+  auto io_phase = [&](bool writing, BitmapIOStats& total) {
+    // Keep the one-thread baseline on the calling thread, without dispatch.
+    if (bitmap_threads == 1) {
+      measure_phase(total.wall_ns, total.cpu_ns, [&]() {
+        for (auto& batch : batches)
+          bitmap_io(bitmap_fds[0], writing, batch.words, batch.first * WORD_BYTES, total);
+      });
+      return;
+    }
+    std::vector<BitmapIOStats> per_worker(bitmap_threads);
+    std::exception_ptr failure;
+    // Elapsed time includes dispatch, scheduling and completion synchronization.
+    // CPU time includes the coordinator, plus worker CPU time added below.
+    measure_phase(total.wall_ns, total.cpu_ns, [&]() {
+      try {
+        workers.run([&](unsigned index) {
+          if (index >= stats.active_workers)
+            return;
+          auto& local = per_worker[index];
+          const size_t begin = batches.size() * index / stats.active_workers;
+          const size_t end = batches.size() * (index + 1) / stats.active_workers;
+          measure_phase(local.wall_ns, local.cpu_ns, [&]() {
+            for (size_t i = begin; i < end; ++i) {
+              auto& batch = batches[i];
+              bitmap_io(bitmap_fds[index], writing, batch.words,
+                        batch.first * WORD_BYTES, local);
+            }
+          });
+        });
+      } catch (...) { failure = std::current_exception(); }
+    });
+    for (const auto& local : per_worker) {
+      total.calls += local.calls;
+      total.bytes += local.bytes;
+      total.short_calls += local.short_calls;
+      total.errors += local.errors;
+      total.cpu_ns += local.cpu_ns;
+    }
+    if (failure)
+      std::rethrow_exception(failure);
+  };
+
+  // All writes complete before the observation window begins.
+  io_phase(true, stats.write);
 
   uint64_t wait_cpu_ns = 0;
   measure_phase(stats.wait_wall_ns, wait_cpu_ns, [&]() { wait_sample_interval(interval); });
   if (!alive())
     throw std::runtime_error("target exited during sampling");
 
-  measure_phase(stats.read.wall_ns, stats.read.cpu_ns, [&]() {
-    for (auto& batch : batches)
-      bitmap_io(false, batch.words, batch.first * WORD_BYTES, stats.read);
-  });
+  io_phase(false, stats.read);
 
   for (const auto& batch : batches)
     for (size_t i = 0; i < batch.words.size(); ++i)
@@ -327,6 +439,7 @@ void IdleBitmapScan::report_stats(const std::vector<RoundStats>& rounds,
   };
   for (const auto& s : rounds) {
     completed += s.complete;
+    total.active_workers += s.active_workers;
     total.requested_hvas += s.requested_hvas;
     total.eligible_hvas += s.eligible_hvas;
     total.unique_pfns += s.unique_pfns;
@@ -339,10 +452,10 @@ void IdleBitmapScan::report_stats(const std::vector<RoundStats>& rounds,
     add_io(total.read, s.read);
   }
   total.complete = scan_rc == 0;
-  fprintf(stderr, "idle-bitmap stats: scan_rc=%d rounds_started=%zu rounds_completed=%u "
+  fprintf(stderr, "idle-bitmap stats: scan_rc=%d threads=%u batch_bytes=%u rounds_started=%zu rounds_completed=%u "
           "write_calls=%" PRIu64 " write_bytes=%" PRIu64 " write_wall_ms=%.3f write_cpu_ms=%.3f "
           "read_calls=%" PRIu64 " read_bytes=%" PRIu64 " read_wall_ms=%.3f read_cpu_ms=%.3f "
-          "wait_wall_ms=%.3f\n", scan_rc, rounds.size(), completed,
+          "wait_wall_ms=%.3f\n", scan_rc, bitmap_threads, bitmap_batch_bytes, rounds.size(), completed,
           total.write.calls, total.write.bytes, total.write.wall_ns / 1e6, total.write.cpu_ns / 1e6,
           total.read.calls, total.read.bytes, total.read.wall_ns / 1e6, total.read.cpu_ns / 1e6,
           total.wait_wall_ns / 1e6);
@@ -356,7 +469,7 @@ void IdleBitmapScan::report_stats(const std::vector<RoundStats>& rounds,
          "\tplanned_pfn_positions\tvalid_hvas\tidle_hvas\taccessed_hvas"
          "\twrite_calls\twrite_bytes\twrite_short_calls\twrite_errors\twrite_wall_ns\twrite_cpu_ns"
          "\tread_calls\tread_bytes\tread_short_calls\tread_errors\tread_wall_ns\tread_cpu_ns"
-         "\twait_wall_ns\tbatch_bytes\n";
+         "\twait_wall_ns\tbatch_bytes\tthreads\tactive_workers\n";
   auto row = [&](const std::string& label, const RoundStats& s) {
     out << label << '\t' << s.complete << '\t' << s.requested_hvas << '\t' << s.eligible_hvas
         << '\t' << s.unique_pfns << '\t' << s.bitmap_words << '\t' << s.bitmap_words * WORD_BITS
@@ -364,7 +477,8 @@ void IdleBitmapScan::report_stats(const std::vector<RoundStats>& rounds,
     for (const auto* io : {&s.write, &s.read})
       out << '\t' << io->calls << '\t' << io->bytes << '\t' << io->short_calls << '\t' << io->errors
           << '\t' << io->wall_ns << '\t' << io->cpu_ns;
-    out << '\t' << s.wait_wall_ns << '\t' << bitmap_batch_bytes << '\n';
+    out << '\t' << s.wait_wall_ns << '\t' << bitmap_batch_bytes << '\t' << bitmap_threads
+        << '\t' << s.active_workers << '\n';
   };
   for (size_t i = 0; i < rounds.size(); ++i)
     row(std::to_string(i + 1), rounds[i]);
@@ -415,10 +529,11 @@ unsigned IdleBitmapScan::save_results(const std::vector<unsigned long>& addresse
 
 int IdleBitmapScan::scan(int pid, unsigned long start, unsigned long end,
     const std::string& address_file, int rounds, double interval,
-    const std::string& output, AddrSequence& refs, const std::string& stats_output, unsigned batch_bytes)
+    const std::string& output, AddrSequence& refs, const std::string& stats_output, unsigned batch_bytes, unsigned threads, unsigned max_pages)
 {
   reset();
   bitmap_batch_bytes = batch_bytes;
+  bitmap_threads = threads;
   refs.clear();
   std::vector<RoundStats> statistics;
   int result = -EINVAL;
@@ -428,21 +543,31 @@ int IdleBitmapScan::scan(int pid, unsigned long start, unsigned long end,
     if (batch_bytes < WORD_BYTES || batch_bytes > BASE_PAGE_SIZE || batch_bytes % WORD_BYTES)
       throw std::runtime_error("bitmap batch size must be a multiple of 8 in [8, 4096]");
 
+    if (threads < 1 || threads > 64)
+      throw std::runtime_error("bitmap threads must be in [1, 64]");
+
+    if (max_pages < 1 || max_pages > MAX_SAMPLE_PAGES)
+      throw std::runtime_error("bitmap page limit must be in [1, 16777216]");
+
     pidfd = syscall(SYS_pidfd_open, pid, 0);
     if (pidfd < 0)
       throw std::runtime_error(strerror(errno));
     pagemap_fd = open_file("/proc/" + std::to_string(pid) + "/pagemap", O_RDONLY);
     flags_fd = open_file("/proc/kpageflags", O_RDONLY);
-    bitmap_fd = open_file("/sys/kernel/mm/page_idle/bitmap", O_RDWR);
+    // Separate open() instances avoid kernfs per-open I/O serialization.
+    bitmap_fds.reserve(threads);
+    for (unsigned i = 0; i < threads; ++i)
+      bitmap_fds.push_back(open_file("/sys/kernel/mm/page_idle/bitmap", O_RDWR));
 
-    const auto addresses = read_addresses(address_file, start, end);
+    const auto addresses = read_addresses(address_file, start, end, max_pages);
     validate_mappings(pid, addresses);
 
     std::vector<PageSample> samples(addresses.size());
+    BitmapWorkerPool workers(threads == 1 ? 0 : threads);
     statistics.reserve(rounds);
     for (int round = 0; round < rounds; ++round) {
       statistics.emplace_back();
-      sample_round(addresses, samples, interval, statistics.back());
+      sample_round(addresses, samples, interval, statistics.back(), workers);
     }
 
     unsigned complete = save_results(addresses, samples, rounds, output, refs);

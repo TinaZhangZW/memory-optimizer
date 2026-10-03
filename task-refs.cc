@@ -49,6 +49,8 @@ static const struct option opts[] = {
   {"help",      no_argument,        NULL, 'h'},
   {"changes",   no_argument,        NULL, 'g'},
   {"version",   no_argument,        NULL, 'r'},
+  {"bitmap-max-pages", required_argument, NULL, 1007},
+  {"bitmap-threads", required_argument, NULL, 1006},
   {"bitmap-batch-bytes", required_argument, NULL, 1005},
   {"scan",      required_argument,  NULL, 1000},
   {"backend",   required_argument,  NULL, 1001},
@@ -78,6 +80,8 @@ static void usage(char *prog)
   fprintf(stderr,
       "    --scan proc-idle|idle-bitmap\n"
       "    --backend numa|none|zswap\n"
+      "    --bitmap-max-pages N  Allowlist limit (1..16777216; default 262144 = 1 GiB)\n"
+      "    --bitmap-threads N  Idle bitmap workers (1..64; default 1)\n"
       "    --bitmap-batch-bytes N  Max contiguous bitmap I/O bytes (8..4096, multiple of 8; default 8)\n"
       "    --addresses FILE  Explicit HVA allowlist for idle-bitmap\n"
       "    --ram-range HEX:HEX  Allowed guest RAM HVA interval\n"
@@ -111,6 +115,28 @@ static void parse_cmdline(int argc, char *argv[])
       if (sscanf(optarg, "%lx:%lx%c", &option.ram_start, &option.ram_end, &extra) != 2) {
         fprintf(stderr, "invalid --ram-range\n"); exit(2);
       }
+      break;
+    }
+    case 1007: {
+      char *end;
+      errno = 0;
+      unsigned long pages = strtoul(optarg, &end, 10);
+      if (errno || *end || optarg[0] < '0' || optarg[0] > '9' ||
+          pages < 1 || pages > 16777216) {
+        fprintf(stderr, "invalid --bitmap-max-pages\n"); exit(2);
+      }
+      option.bitmap_max_pages = pages;
+      break;
+    }
+    case 1006: {
+      char *end;
+      errno = 0;
+      unsigned long threads = strtoul(optarg, &end, 10);
+      if (errno || *end || optarg[0] < '0' || optarg[0] > '9' ||
+          threads < 1 || threads > 64) {
+        fprintf(stderr, "invalid --bitmap-threads\n"); exit(2);
+      }
+      option.bitmap_threads = threads;
       break;
     }
     case 1005: {

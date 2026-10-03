@@ -150,6 +150,8 @@ public:
   std::string output_file;
   std::string config_file;
 
+  unsigned bitmap_max_pages = 262144;
+  unsigned bitmap_threads = 1;
   unsigned bitmap_batch_bytes = 8;
   std::string scan_backend = "proc-idle";
   std::string migration_backend = "numa";

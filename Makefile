@@ -39,7 +39,7 @@ page-refs: page-refs.c $(LIB_SOURCE_FILES)
 
 task-refs: task-refs.cc $(TASK_REFS_SOURCE_FILES) $(TASK_REFS_HEADER_FILES)
 	./get_version.sh
-	$(CXX) $< $(TASK_REFS_SOURCE_FILES) -o $@ $(CXXFLAGS) -lnuma
+	$(CXX) $< $(TASK_REFS_SOURCE_FILES) -o $@ $(CXXFLAGS) -lnuma -pthread
 
 task-maps: task-maps.cc ProcMaps.cc ProcMaps.h
 	$(CXX) $< ProcMaps.cc -o $@ $(CXXFLAGS)

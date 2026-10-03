@@ -6,6 +6,10 @@
 #include <cerrno>
 #include <cstdarg>
 #include <cstring>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <fstream>
 #include <iostream>
 #include <linux/kernel-page-flags.h>
@@ -32,6 +36,7 @@ static int next_fd = 100;
 static unsigned closed_fds;
 static int opens_until_failure = -1;
 static Fault fault;
+static int fault_fd = -1;
 static int interruptions;
 static std::vector<timespec> deadlines;
 static std::vector<unsigned long> advised;
@@ -42,6 +47,31 @@ static uint64_t pfn_stride = 1;
 static uint64_t bitmap_value;
 static bool fake_timing;
 static uint64_t wall_time_ns, cpu_time_ns;
+static bool parallel_test;
+static thread_local uint64_t worker_cpu_ns;
+static std::mutex event_mutex;
+static std::condition_variable rendezvous;
+static unsigned rendezvous_target;
+static std::map<int, std::thread::id> fd_owners;
+static std::vector<char> events;
+static std::map<off_t, unsigned> written_offsets, read_offsets;
+
+static void record_io(int fd, off_t offset, bool writing) {
+  if (!parallel_test)
+    return;
+  worker_cpu_ns += writing ? 3000000 : 5000000;
+  std::unique_lock<std::mutex> lock(event_mutex);
+  auto inserted = fd_owners.emplace(fd, std::this_thread::get_id());
+  assert(inserted.second || inserted.first->second == std::this_thread::get_id());
+  events.push_back(writing ? 'W' : 'R');
+  (writing ? written_offsets : read_offsets)[offset]++;
+  if (writing && rendezvous_target) {
+    rendezvous.notify_all();
+    assert(rendezvous.wait_for(lock, std::chrono::seconds(5), []() {
+      return fd_owners.size() >= rendezvous_target;
+    }));
+  }
+}
 
 static int open_mock(FileKind kind)
 {
@@ -107,15 +137,16 @@ extern "C" ssize_t __wrap_pread(int fd, void *buf, size_t count, off_t offset)
     value = fault == NO_SAMPLES ? 0 : (1ULL << KPF_ANON) | (1ULL << KPF_LRU);
   else {
     assert(kind == BITMAP);
+    record_io(fd, offset, false);
     if (fake_timing) {
       wall_time_ns += 11000000;
       cpu_time_ns += 5000000;
     }
-    if (fault == READ_ERROR) {
+    if (fault == READ_ERROR && (fault_fd < 0 || fd == fault_fd)) {
       errno = EIO;
       return -1;
     }
-    if (fault == SHORT_READ)
+    if (fault == SHORT_READ && (fault_fd < 0 || fd == fault_fd))
       return 4;
     value = bitmap_value;
   }
@@ -128,6 +159,7 @@ extern "C" ssize_t __wrap_pread(int fd, void *buf, size_t count, off_t offset)
 extern "C" ssize_t __wrap_pwrite(int fd, const void *buf, size_t count, off_t offset)
 {
   assert(open_fds.at(fd) == BITMAP && count >= 8 && count <= 4096 && count % 8 == 0 && offset % 8 == 0);
+  record_io(fd, offset, true);
   // Every written bit must belong to one of the mock target pages.
   for (size_t i = 0; i < count / 8; ++i) {
     uint64_t mask = static_cast<const uint64_t *>(buf)[i];
@@ -143,11 +175,11 @@ extern "C" ssize_t __wrap_pwrite(int fd, const void *buf, size_t count, off_t of
     wall_time_ns += 7000000;
     cpu_time_ns += 3000000;
   }
-  if (fault == WRITE_ERROR) {
+  if (fault == WRITE_ERROR && (fault_fd < 0 || fd == fault_fd)) {
     errno = EIO;
     return -1;
   }
-  if (fault == SHORT_WRITE)
+  if (fault == SHORT_WRITE && (fault_fd < 0 || fd == fault_fd))
     return 4;
   return count;
 }
@@ -158,6 +190,11 @@ extern "C" int __real_clock_nanosleep(clockid_t, int, const struct timespec *, s
 extern "C" int __wrap_clock_gettime(clockid_t clock, struct timespec *now)
 {
   assert(clock == CLOCK_MONOTONIC || clock == CLOCK_THREAD_CPUTIME_ID);
+  if (parallel_test && clock == CLOCK_THREAD_CPUTIME_ID) {
+    *now = {static_cast<time_t>(worker_cpu_ns / 1000000000),
+            static_cast<long>(worker_cpu_ns % 1000000000)};
+    return 0;
+  }
   if (real_time)
     return __real_clock_gettime(clock, now);
   if (fault == CLOCK_ERROR) {
@@ -175,6 +212,10 @@ extern "C" int __wrap_clock_nanosleep(clockid_t clock, int flags,
 {
   assert(clock == CLOCK_MONOTONIC && flags == TIMER_ABSTIME && !remaining);
   deadlines.push_back(*deadline);
+  if (parallel_test) {
+    std::lock_guard<std::mutex> lock(event_mutex);
+    events.push_back('S');
+  }
   if (real_time)
     return __real_clock_nanosleep(clock, flags, deadline, remaining);
   // Deliberately differ from the return value: clock_nanosleep doesn't use errno.
@@ -423,7 +464,97 @@ int main(int argc, char **argv)
     fake_timing = false;
     std::cout << "PASS: I/O failures, short transfers, empty scans and statistics output failure\n";
 
+    write_address("0x1000\n0x2000\n0x3000");
+    for (unsigned limit : {0U, 2U, 16777217U}) {
+      assert(scanner.scan(42, 0x1000, 0x4000, addresses, 1, 0.001,
+                          output, refs, stats_output, 8, 1, limit) == -EINVAL);
+      check_failed_scan();
+    }
+    assert(scanner.scan(42, 0x1000, 0x4000, addresses, 1, 0.001,
+                        output, refs, stats_output, 8, 1, 3) == 0);
+    assert(scanner.scan(42, 0x1000, 0x4000, addresses, 1, 0.001,
+                        output, refs, stats_output, 8, 1, 16777216) == 0);
+    std::cout << "PASS: explicit page limit rejects overflow and enforces the allowlist bound\n";
     real_time = true;
+    parallel_test = true;
+    pfn_stride = 64;
+    bitmap_value = ~0ULL;
+    write_address("0x1000\n0x2000\n0x3000");
+    auto clear_parallel = [&]() {
+      fd_owners.clear(); events.clear(); written_offsets.clear(); read_offsets.clear();
+      rendezvous_target = 0;
+    };
+    for (unsigned workers : {2U, 4U}) {
+      clear_parallel();
+      rendezvous_target = workers == 2 ? 2 : 3;
+      assert(scanner.scan(42, 0x1000, 0x4000, addresses, 2, 0.001,
+                          output, refs, stats_output, 8, workers) == 0);
+      assert(open_fds.size() == 3 + workers);
+      assert(fd_owners.size() == rendezvous_target);
+      assert(std::string(events.begin(), events.end()) == "WWWSRRRWWWSRRR");
+      assert(written_offsets.size() == 3 && read_offsets.size() == 3);
+      for (const auto& entry : written_offsets) assert(entry.second == 2);
+      for (const auto& entry : read_offsets) assert(entry.second == 2);
+      stats = read_stats(stats_output);
+      for (const auto& label : {"1", "2"}) {
+        const auto& row = stats.at(label);
+        assert(row.at("threads") == workers && row.at("active_workers") == rendezvous_target);
+        assert(row.at("read_calls") == 3 && row.at("write_calls") == 3);
+        assert(row.at("read_bytes") == 24 && row.at("write_bytes") == 24);
+        assert(row.at("write_cpu_ns") == 9000000 && row.at("read_cpu_ns") == 15000000);
+        assert(row.at("valid_hvas") == 3 && row.at("idle_hvas") == 3);
+      }
+    }
+    clear_parallel();
+    // One large batch is not split just to occupy additional workers.
+    assert(scanner.scan(42, 0x1000, 0x4000, addresses, 1, 0.001,
+                        output, refs, stats_output, 4096, 4) == 0);
+    stats = read_stats(stats_output);
+    assert(stats.at("1").at("active_workers") == 1 && stats.at("1").at("read_calls") == 1);
+    for (Fault injected : {WRITE_ERROR, READ_ERROR, SHORT_WRITE, SHORT_READ, NO_SAMPLES}) {
+      clear_parallel();
+      fault = injected;
+      assert(scanner.scan(42, 0x1000, 0x4000, addresses, 1, 0.001,
+                          output, refs, stats_output, 8, 4) == (fault == NO_SAMPLES ? -ENODATA : -EINVAL));
+      check_failed_scan();
+      stats = read_stats(stats_output);
+      assert(stats.at("total").at("complete") == 0);
+      if (fault == WRITE_ERROR || fault == SHORT_WRITE) {
+        assert(stats.at("1").at("read_calls") == 0);
+        assert(stats.at("1").at("write_calls") == 3);
+      }
+    }
+    fault = WRITE_ERROR;
+    fault_fd = next_fd + 3; // Fail only worker zero; other workers must finish.
+    clear_parallel();
+    assert(scanner.scan(42, 0x1000, 0x4000, addresses, 1, 0.001,
+                        output, refs, stats_output, 8, 4) == -EINVAL);
+    check_failed_scan();
+    stats = read_stats(stats_output);
+    assert(stats.at("1").at("write_errors") == 1);
+    assert(stats.at("1").at("write_bytes") == 16);
+    assert(stats.at("1").at("write_calls") == 3);
+    assert(stats.at("1").at("read_calls") == 0);
+    fault_fd = -1;
+    fault = NONE;
+    clear_parallel();
+    for (int fail_after = 3; fail_after < 7; ++fail_after) {
+      opens_until_failure = fail_after;
+      assert(scanner.scan(42, 0x1000, 0x4000, addresses, 1, 0.001,
+                          output, refs, stats_output, 8, 4) == -EINVAL);
+      check_failed_scan();
+    }
+    opens_until_failure = -1;
+    for (unsigned workers : {0U, 65U}) {
+      assert(scanner.scan(42, 0x1000, 0x4000, addresses, 1, 0.001,
+                          output, refs, stats_output, 8, workers) == -EINVAL);
+      check_failed_scan();
+    }
+    parallel_test = false;
+    pfn_stride = 1;
+    bitmap_value = 0;
+    write_address("0x1000\n0x2000");
+    std::cout << "PASS: independent persistent workers overlap I/O, preserve coverage, synchronize phases, sum CPU and clean up failures\n";
     deadlines.clear();
     struct sigaction action = {}, previous;
     action.sa_handler = alarm_handler;
