@@ -232,14 +232,17 @@ static void validate_mappings(int pid, const std::vector<unsigned long>& address
   ProcMaps maps;
   const auto vmas = maps.load(pid);
 
+  // Both proc maps and the validated allowlist are sorted by address.
+  // Advance each cursor once instead of visiting every VMA for every page.
+  size_t index = 0;
   for (unsigned long address : addresses) {
-    bool valid = false;
-
-    for (const auto& vma : vmas) {
-      if (vma.start <= address && address < vma.end)
-        valid = vma.read && vma.write && !vma.exec && !vma.mayshare && !vma.ino;
-    }
-    if (!valid)
+    while (index < vmas.size() && vmas[index].end <= address)
+      ++index;
+    if (index == vmas.size())
+      throw std::runtime_error("allowlist address has no VMA");
+    const auto& vma = vmas[index];
+    if (address < vma.start || !vma.read || !vma.write || vma.exec ||
+        vma.mayshare || vma.ino)
       throw std::runtime_error("allowlist is not private writable anonymous RAM");
   }
 }
@@ -606,9 +609,24 @@ int IdleBitmapScan::pageout(const std::vector<void *>& addresses, unsigned long 
   uint64_t syscall_wall_ns = 0;
   uint64_t syscall_cpu_ns = 0;
 
+  uint64_t phase_wall_start = 0, phase_cpu_start = 0;
+  uint64_t submit_wall_ns = 0, submit_cpu_ns = 0;
+  uint64_t total_wall_ns = 0, total_cpu_ns = 0;
+  bool timing_started = false, submission_done = false, timing_valid = true;
+  int result = -EIO;
+  auto read_clock = [&](clockid_t clock) {
+    try {
+      return clock_ns(clock);
+    } catch (...) {
+      timing_valid = false;
+      throw;
+    }
+  };
+
   try {
-    const uint64_t phase_wall_start = clock_ns(CLOCK_MONOTONIC);
-    const uint64_t phase_cpu_start = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+    phase_wall_start = read_clock(CLOCK_MONOTONIC);
+    phase_cpu_start = read_clock(CLOCK_THREAD_CPUTIME_ID);
+    timing_started = true;
     for (void *ptr : addresses) {
       if (attempted_pages >= max_pageout_pages)
         break;
@@ -625,46 +643,70 @@ int IdleBitmapScan::pageout(const std::vector<void *>& addresses, unsigned long 
       }
 
       struct iovec iov = {ptr, BASE_PAGE_SIZE};
+      const uint64_t call_cpu_start = read_clock(CLOCK_THREAD_CPUTIME_ID);
+      const uint64_t call_wall_start = read_clock(CLOCK_MONOTONIC);
       ++attempted_pages;
-      const uint64_t call_cpu_start = clock_ns(CLOCK_THREAD_CPUTIME_ID);
-      const uint64_t call_wall_start = clock_ns(CLOCK_MONOTONIC);
       ssize_t bytes_advised = syscall(SYS_process_madvise, pidfd, &iov, 1, MADV_PAGEOUT, 0);
       const int advise_errno = errno;
-      syscall_wall_ns += clock_ns(CLOCK_MONOTONIC) - call_wall_start;
-      syscall_cpu_ns += clock_ns(CLOCK_THREAD_CPUTIME_ID) - call_cpu_start;
 
-      if (bytes_advised != BASE_PAGE_SIZE) {
-        ++error_pages;
-        if (bytes_advised < 0)
-          fprintf(stderr, "pageout 0x%lx: %s\n", address, strerror(advise_errno));
-        continue;
+      std::exception_ptr clock_failure;
+      try {
+        syscall_wall_ns += read_clock(CLOCK_MONOTONIC) - call_wall_start;
+        syscall_cpu_ns += read_clock(CLOCK_THREAD_CPUTIME_ID) - call_cpu_start;
+      } catch (...) {
+        timing_valid = false;
+        clock_failure = std::current_exception();
       }
-      submitted_bytes += bytes_advised;
-      requested.push_back(address);
+      // Preserve the advice result even when a trailing clock read fails.
+      if (bytes_advised == BASE_PAGE_SIZE) {
+        submitted_bytes += bytes_advised;
+        requested.push_back(address);
+      } else {
+        ++error_pages;
+      }
+      if (clock_failure)
+        std::rethrow_exception(clock_failure);
+      if (bytes_advised < 0)
+        fprintf(stderr, "pageout 0x%lx: %s\n", address, strerror(advise_errno));
     }
 
-    const uint64_t submit_wall_ns = clock_ns(CLOCK_MONOTONIC) - phase_wall_start;
-    const uint64_t submit_cpu_ns = clock_ns(CLOCK_THREAD_CPUTIME_ID) - phase_cpu_start;
+    submit_wall_ns = read_clock(CLOCK_MONOTONIC) - phase_wall_start;
+    submit_cpu_ns = read_clock(CLOCK_THREAD_CPUTIME_ID) - phase_cpu_start;
+    submission_done = true;
 
     // A swapped PTE does not distinguish zswap from ordinary swap or swapcache.
+    // On an exception, swapped_pages counts only verification reads completed.
     for (unsigned long address : requested) {
       uint64_t entry = read_word(pagemap_fd, address / BASE_PAGE_SIZE * WORD_BYTES);
-
       if (entry & PAGEMAP_SWAPPED)
         ++swapped_pages;
     }
-
-    fprintf(stderr, "pageout: candidates=%zu attempted_pages=%lu submitted_bytes=%lu skipped=%lu errors=%lu swapped_after=%lu\n",
-            addresses.size(), attempted_pages, submitted_bytes, skipped_pages, error_pages, swapped_pages);
-    const uint64_t total_wall_ns = clock_ns(CLOCK_MONOTONIC) - phase_wall_start;
-    const uint64_t total_cpu_ns = clock_ns(CLOCK_THREAD_CPUTIME_ID) - phase_cpu_start;
-    fprintf(stderr, "pageout stats: calls=%lu syscall_wall_ms=%.3f syscall_cpu_ms=%.3f "
-            "submit_wall_ms=%.3f submit_cpu_ms=%.3f total_wall_ms=%.3f total_cpu_ms=%.3f\n",
-            attempted_pages, syscall_wall_ns / 1e6, syscall_cpu_ns / 1e6,
-            submit_wall_ns / 1e6, submit_cpu_ns / 1e6, total_wall_ns / 1e6, total_cpu_ns / 1e6);
-    return error_pages ? -EIO : 0;
+    result = error_pages ? -EIO : 0;
   } catch (const std::exception& e) {
     fprintf(stderr, "pageout: %s\n", e.what());
-    return -EIO;
   }
+
+  // Report partial work on failure, without allowing clock errors to escape.
+  try {
+    if (!timing_started)
+      throw std::runtime_error("pageout timing did not start");
+    total_wall_ns = read_clock(CLOCK_MONOTONIC) - phase_wall_start;
+    total_cpu_ns = read_clock(CLOCK_THREAD_CPUTIME_ID) - phase_cpu_start;
+    if (!submission_done) {
+      submit_wall_ns = total_wall_ns;
+      submit_cpu_ns = total_cpu_ns;
+    }
+  } catch (const std::exception& e) {
+    timing_valid = false;
+    result = -EIO;
+    fprintf(stderr, "pageout timing: %s\n", e.what());
+  }
+
+  fprintf(stderr, "pageout: candidates=%zu attempted_pages=%lu submitted_bytes=%lu skipped=%lu errors=%lu swapped_after=%lu\n",
+          addresses.size(), attempted_pages, submitted_bytes, skipped_pages, error_pages, swapped_pages);
+  fprintf(stderr, "pageout stats: complete=%d timing_valid=%d calls=%lu syscall_wall_ms=%.3f syscall_cpu_ms=%.3f "
+          "submit_wall_ms=%.3f submit_cpu_ms=%.3f total_wall_ms=%.3f total_cpu_ms=%.3f\n",
+          result == 0, timing_valid, attempted_pages, syscall_wall_ns / 1e6, syscall_cpu_ns / 1e6,
+          submit_wall_ns / 1e6, submit_cpu_ns / 1e6, total_wall_ns / 1e6, total_cpu_ns / 1e6);
+  return result;
 }

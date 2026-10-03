@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstdarg>
 #include <cstring>
+#include <cstdio>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -46,6 +47,10 @@ static volatile sig_atomic_t signals_received;
 static uint64_t pfn_stride = 1;
 static uint64_t bitmap_value;
 static bool fake_timing;
+static bool pageout_timing;
+static int polls_until_exit = -1;
+static bool fail_verification, fail_pageout_clock;
+static std::vector<proc_maps_entry> mock_vmas;
 static uint64_t wall_time_ns, cpu_time_ns;
 static bool parallel_test;
 static thread_local uint64_t worker_cpu_ns;
@@ -89,6 +94,7 @@ static int open_mock(FileKind kind)
 std::vector<proc_maps_entry> ProcMaps::load(pid_t pid)
 {
   assert(pid == 42);
+  if (!mock_vmas.empty()) return mock_vmas;
   proc_maps_entry vma = {};
   vma.start = 0x1000;
   vma.end = 0x4000;
@@ -123,6 +129,12 @@ extern "C" int __wrap_poll(struct pollfd *fds, nfds_t count, int timeout)
 {
   assert(count == 1 && timeout == 0);
   assert(open_fds.at(fds[0].fd) == PIDFD);
+  if (pageout_timing) {
+    wall_time_ns += 200000;
+    cpu_time_ns += 100000;
+    if (polls_until_exit == 0) return 1;
+    if (polls_until_exit > 0) --polls_until_exit;
+  }
   return 0;
 }
 
@@ -131,6 +143,14 @@ extern "C" ssize_t __wrap_pread(int fd, void *buf, size_t count, off_t offset)
   assert(count >= 8 && count <= 4096 && count % 8 == 0 && offset % 8 == 0);
   FileKind kind = open_fds.at(fd);
   uint64_t value = 0;
+  if (kind == PAGEMAP && pageout_timing) {
+    wall_time_ns += 1000000;
+    cpu_time_ns += 500000;
+    if (fail_verification && advised.size() == 2) {
+      errno = EIO;
+      return -1;
+    }
+  }
   if (kind == PAGEMAP)
     value = (1ULL << 63) | (100 + pfn_stride * offset / 8);
   else if (kind == FLAGS)
@@ -197,7 +217,7 @@ extern "C" int __wrap_clock_gettime(clockid_t clock, struct timespec *now)
   }
   if (real_time)
     return __real_clock_gettime(clock, now);
-  if (fault == CLOCK_ERROR) {
+  if (fault == CLOCK_ERROR || (pageout_timing && fail_pageout_clock && !advised.empty())) {
     errno = EIO;
     return -1;
   }
@@ -248,6 +268,10 @@ extern "C" long __wrap_syscall(long number, ...)
   va_end(args);
   assert(iov->iov_len == 4096);
   advised.push_back(reinterpret_cast<unsigned long>(iov->iov_base));
+  if (pageout_timing) {
+    wall_time_ns += 7000000;
+    cpu_time_ns += 3000000;
+  }
   errno = EIO;
   return advise_result;
 }
@@ -278,6 +302,42 @@ static std::map<std::string, std::map<std::string, uint64_t>> read_stats(const s
     assert(!std::getline(row, field, '\t'));
   }
   return rows;
+}
+
+extern "C" int __real_close(int);
+
+// Capture the public statistics, rather than testing internal clock helpers.
+static std::map<std::string, double> pageout_stats(IdleBitmapScan& scanner,
+    const std::vector<void *>& candidates, unsigned limit, int expected_rc)
+{
+  FILE *capture = tmpfile();
+  assert(capture);
+  fflush(stderr);
+  int saved = dup(STDERR_FILENO);
+  assert(saved >= 0 && dup2(fileno(capture), STDERR_FILENO) >= 0);
+  pageout_timing = fake_timing = true;
+  advised.clear();
+  wall_time_ns = cpu_time_ns = 0;
+  assert(scanner.pageout(candidates, limit) == expected_rc);
+  pageout_timing = fake_timing = false;
+  fflush(stderr);
+  assert(dup2(saved, STDERR_FILENO) >= 0);
+  __real_close(saved);
+  rewind(capture);
+  std::map<std::string, double> values;
+  char line[1024];
+  while (fgets(line, sizeof(line), capture)) {
+    std::istringstream fields(line);
+    std::string field;
+    while (fields >> field) {
+      size_t equals = field.find('=');
+      if (equals != std::string::npos)
+        values[field.substr(0, equals)] = std::stod(field.substr(equals + 1));
+    }
+  }
+  fclose(capture);
+  assert(values.count("complete") && values.count("timing_valid"));
+  return values;
 }
 
 int main(int argc, char **argv)
@@ -341,6 +401,60 @@ int main(int argc, char **argv)
     assert((advised == std::vector<unsigned long>{0x1000, 0x2000}));
     write_address("0x2000");
     std::cout << "PASS: pageout limit counts successful, failed and short attempts; skips do not consume it\n";
+
+    // Sorted VMA traversal must still reject holes and forbidden mappings.
+    write_address("0x1000\n0x2000");
+    proc_maps_entry first_vma = {};
+    first_vma.start = 0x1000; first_vma.end = 0x2000;
+    first_vma.read = first_vma.write = true;
+    proc_maps_entry second_vma = first_vma;
+    second_vma.start = 0x2000; second_vma.end = 0x3000;
+    mock_vmas = {first_vma, second_vma};
+    assert(scan() == 0);
+    mock_vmas[1].start = 0x2800;
+    assert(scan() == -EINVAL);
+    check_failed_scan();
+    mock_vmas[1] = second_vma;
+    mock_vmas[1].mayshare = true;
+    assert(scan() == -EINVAL);
+    check_failed_scan();
+    mock_vmas.clear();
+    assert(scan() == 0);
+    std::cout << "PASS: sorted VMA validation crosses boundaries and rejects holes/shared RAM\n";
+
+    auto timing = pageout_stats(scanner, candidates, 2, 0);
+    assert(timing.at("calls") == 2 && timing.at("complete") == 1);
+    assert(timing.at("timing_valid") == 1);
+    assert(timing.at("syscall_wall_ms") == 14 && timing.at("syscall_cpu_ms") == 6);
+    assert(timing.at("submit_wall_ms") == 16.4 && timing.at("submit_cpu_ms") == 7.2);
+    assert(timing.at("total_wall_ms") == 18.4 && timing.at("total_cpu_ms") == 8.2);
+    for (long result : {-1L, 0L, 2048L}) {
+      advise_result = result;
+      timing = pageout_stats(scanner, candidates, 1, -EIO);
+      assert(timing.at("calls") == 1 && timing.at("errors") == 1);
+      assert(timing.at("complete") == 0 && timing.at("timing_valid") == 1);
+      assert(timing.at("syscall_wall_ms") == 7 && timing.at("syscall_cpu_ms") == 3);
+      assert(timing.at("submit_wall_ms") == 8.2 && timing.at("total_wall_ms") == 8.2);
+    }
+    advise_result = 4096;
+    polls_until_exit = 1;
+    timing = pageout_stats(scanner, candidates, 2, -EIO);
+    assert(timing.at("calls") == 1 && timing.at("submitted_bytes") == 4096);
+    assert(timing.at("complete") == 0 && timing.at("timing_valid") == 1);
+    assert(timing.at("syscall_wall_ms") == 7 && timing.at("total_wall_ms") == 8.4);
+    polls_until_exit = -1;
+    fail_verification = true;
+    timing = pageout_stats(scanner, candidates, 2, -EIO);
+    assert(timing.at("complete") == 0 && timing.at("calls") == 2);
+    assert(timing.at("submit_wall_ms") == 16.4 && timing.at("total_wall_ms") == 17.4);
+    fail_verification = false;
+    fail_pageout_clock = true;
+    timing = pageout_stats(scanner, candidates, 2, -EIO);
+    assert(timing.at("complete") == 0 && timing.at("timing_valid") == 0);
+    assert(timing.at("calls") == 1 && timing.at("submitted_bytes") == 4096);
+    fail_pageout_clock = false;
+    write_address("0x2000");
+    std::cout << "PASS: pageout timing boundaries, failed/short calls and partial failure statistics\n";
 
     for (int fail_after = 0; fail_after < 4; ++fail_after) {
       opens_until_failure = fail_after;

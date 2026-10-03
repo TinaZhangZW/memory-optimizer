@@ -194,3 +194,12 @@ by itself prove zswap storage or immediate return of PFNs to the buddy allocator
 Use zswap and swap-I/O counter deltas alongside these values. Host zswap must
 be enabled and sufficient swap slots must be available even for compressible
 pages stored in RAM.
+
+Pageout statistics now include `complete` and `timing_valid`. `complete=1`
+requires the submission and verification passes to finish with no failed or
+short advice calls. `timing_valid=0` means a clock operation failed; do not
+interpret the durations as complete measurements. Exceptions such as target
+exit or pagemap failure still print attempted calls, submitted bytes and the
+timing accumulated so far. When verification stops early, `swapped_after`
+counts only completed verification reads, not all successfully advised pages.
+If submission stops early, its duration covers the partial submission loop.
