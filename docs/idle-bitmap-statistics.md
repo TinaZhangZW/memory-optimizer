@@ -88,6 +88,24 @@ grow with input size; full scans can consume GiB of scanner memory and hundreds
 of MiB of output. A single long scan also has different start/end timestamps
 for individual pages; it is not a simultaneous snapshot.
 
+## Guest memory population workload
+
+`tests/guest-memory-fill.c` is the workload used for the near-full 64 GiB VM
+experiment. Build a static binary on the host and copy it into the guest:
+
+```bash
+gcc -static -O2 -Wall -Wextra tests/guest-memory-fill.c -o /tmp/guest-memory-fill
+```
+
+Run it as root **inside the guest**, with the number of GiB to populate as its
+only argument (for example, `sudo /tmp/guest-memory-fill 59`). Choose the size
+from guest `MemAvailable`, leaving at least 2 GiB of headroom. It writes every
+4 KiB page, disables guest THP for its mapping, and locks the allocation in
+memory. After printing `ready`, it repeatedly reads a 256 MiB hot subset while
+retaining the remaining pages idle. SIGTERM releases the allocation. This is
+a mostly idle data-page workload, not an executable-code-page classifier.
+Host THP eligibility must be configured separately for QEMU.
+
 ## Fields
 
 | Field | Meaning |
