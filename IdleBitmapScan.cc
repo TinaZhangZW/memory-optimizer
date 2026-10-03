@@ -15,9 +15,9 @@
 #include <fcntl.h>
 #include <fstream>
 #include <linux/kernel-page-flags.h>
+#include <linux/mman.h>
 #include <poll.h>
 #include <stdexcept>
-#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <time.h>

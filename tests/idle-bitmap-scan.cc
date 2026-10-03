@@ -14,11 +14,11 @@
 #include <fstream>
 #include <iostream>
 #include <linux/kernel-page-flags.h>
+#include <linux/mman.h>
 #include <map>
 #include <poll.h>
 #include <signal.h>
 #include <sstream>
-#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/uio.h>
