@@ -27,6 +27,11 @@ struct FixtureState
   bool short_read = false;
   bool io_error = false;
   bool sparse_pfns = false;
+  unsigned bitmap_writes = 0;
+  bool lock_busy = false;
+  bool lose_lru = false;
+  bool short_write = false;
+  std::map<uint64_t, uint64_t> written_bitmap;
 };
 
 extern FixtureState state;
