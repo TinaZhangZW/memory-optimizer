@@ -3,6 +3,7 @@
 #include "IdleBitmapScan.h"
 #include "IdlePageIO.h"
 
+#include <array>
 #include <fcntl.h>
 #include <map>
 #include <poll.h>
@@ -25,6 +26,8 @@ constexpr uint64_t MAX_SCAN_BYTES = 64ULL * 1024 * 1024 * 1024;
 constexpr uint64_t NS_PER_SECOND = 1000000000;
 constexpr uint64_t NS_PER_MS = 1000000;
 using BitmapWords = std::map<uint64_t, uint64_t>;
+
+constexpr size_t IO_BATCH_WORDS = IDLE_BITMAP_PAGE_SIZE / WORD_BYTES;
 
 uint64_t monotonic_ns()
 {
@@ -60,11 +63,26 @@ void transfer_bitmap_words(int bitmap_fd, IOOperation operation,
    * Write masks set bits only for selected PFNs.
    * Reads return the entire bitmap word.
    */
-  for (auto& word : bitmap) {
-    uint64_t value = word.second;
-    transfer_words(bitmap_fd, operation, word.first * WORD_BYTES, &value, 1);
-    if (operation == IOOperation::READ)
-      word.second = value;
+  for (auto batch_begin = bitmap.begin(); batch_begin != bitmap.end();) {
+    const uint64_t first_word = batch_begin->first;
+    auto batch_end = batch_begin;
+    std::array<uint64_t, IO_BATCH_WORDS> words;
+    size_t count = 0;
+
+    // Merge only adjacent bitmap words.
+    while (batch_end != bitmap.end() && count < words.size() &&
+           batch_end->first == first_word + count) {
+      words[count++] = batch_end->second;
+      ++batch_end;
+    }
+
+    transfer_words(bitmap_fd, operation, first_word * WORD_BYTES,
+                   words.data(), count);
+
+    for (size_t i = 0; batch_begin != batch_end; ++batch_begin, ++i) {
+      if (operation == IOOperation::READ)
+        batch_begin->second = words[i];
+    }
   }
 }
 
